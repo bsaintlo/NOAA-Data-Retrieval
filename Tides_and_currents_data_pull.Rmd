@@ -1,0 +1,295 @@
+---
+title: "Retrieve Data From Tides and Currents"
+date: ""
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Let's get the data for each stations and get the information for the device used for data collection so we can save this for the metadata
+For Example : some of the data is recorded by buoy while other by ADCP with different placement. 
+
+
+```{r}
+
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(dplyr)
+
+years <- 2017:2024
+datum <- "IGLD"
+time_zone <- "lst"
+units <- "metric"
+format <- "csv"
+
+met_params <- c(
+  "air_temperature", "water_temperature", "wind", "air_pressure", "salinity"
+)
+wl_params <- c("water_level")
+
+station_ids <- c("9044020")
+# station_ids <- c(
+#   "9044020",
+#   "9063090",
+#   "9044036",
+#   "9044030",
+#   "9063085",
+#   "gl0201",
+#   "9063079",
+#   "gl0101",
+#   "9063063",
+#   "9063053",
+#   "9063038",
+#   "9063028",
+#   "9063020")
+
+base_url <- "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/%s.json?expand=details"
+
+get_json <- function(url) {
+  resp <- tryCatch(GET(url), error = function(e) NULL)
+  if (!is.null(resp) && status_code(resp) == 200) {
+    return(fromJSON(content(resp, "text")))
+  }
+  NULL
+}
+
+stations_list <- list()
+
+for (station_id in station_ids) {
+  url <- sprintf(base_url, station_id)
+  data <- get_json(url)
+  if (!is.null(data) && is.list(data$stations) && length(data$stations) > 0) {
+    station <- data$stations
+    # Products
+    product_names <- NULL
+    if (!is.null(station$products$self)) {
+      products_data <- get_json(station$products$self)
+      if (!is.null(products_data)) {
+        product_names <- paste(products_data$products$name, collapse = ", ")
+      }
+    }
+    # Add in the info about the Bins
+    bins_info <- NULL
+    if (!is.null(station$bins$self)) {
+      bins_data <- get_json(station$bins$self)
+      if (!is.null(bins_data)) {
+        target_row <- bins_data$bins[bins_data$bins$num == bins_data$real_time_bin, ]
+        bins_info <- list(
+          nbr_of_bins = bins_data$nbr_of_bins,
+          max_pics_bin = bins_data$max_pics_bin,
+          units = bins_data$units,
+          bin_size = bins_data$bin_size,
+          center_bin_1_dist = bins_data$center_bin_1_dist,
+          real_time_bin = bins_data$real_time_bin,
+          bin_depth = target_row$depth,
+          bin_distance = target_row$distance
+        )
+      }
+    }
+    # Add in the info about the Sensors
+    sensors_info <- NULL
+    if (!is.null(station$sensors$self)) {
+      sens_data <- get_json(station$sensors$self)
+      if (!is.null(sens_data)) {
+        sensors_info <- list(
+          units = sens_data$units,
+          status = sens_data$sensors$status,
+          refdatum = sens_data$sensors$refdatum,
+          sensorID = sens_data$sensors$sensorID,
+          name = sens_data$sensors$name,
+          elevation = sens_data$sensors$elevation,
+          dcp = sens_data$sensors$dcp,
+          elevation_m = as.numeric(sens_data$sensors$elevation) * 0.3048
+        )
+      }
+    }
+    #  Add in the info about the Deployment of the ADCP or Buoy device
+    dep_info <- NULL
+    if (!is.null(station$deployments$self)) {
+      dep_data <- get_json(station$deployments$self)
+      if (!is.null(dep_data)) {
+        dep_info <- list(
+          flood_direction_degrees = dep_data$flood_direction_degrees,
+          orientation = dep_data$orientation,
+          sensor_depth = dep_data$sensor_depth,
+          depth = dep_data$depth,
+          measured_depth = dep_data$measured_depth,
+          height_from_bottom = dep_data$height_from_bottom,
+          sample_interval = dep_data$sample_interval
+        )
+      }
+    }
+    
+    # Put all the information retrieved for each station in a list
+    stations_list[[station$id]] <- list(
+    
+      id = station$id,
+      name = station$name,
+      lat = station$lat,
+      lng = station$lng,
+      port_code = station$portscode,
+      product_names = product_names,
+      datum = "IGLD",
+      time_zone = "lst",
+      units = "metric",
+      bins = bins_info,
+      sensors = sensors_info,
+      deployments = dep_info
+    )
+  }
+}
+# testing the outcome
+#print(stations_list)
+
+```
+
+```{r}
+# Helper function to call the API
+fetch_data <- function(station, year, param, product_type, datum, time_zone, units) {
+  start_date <- ymd(sprintf("%d0101", year))
+  end_date <- ymd(sprintf("%d1231", year))
+  current_start <- start_date
+  all_data <- list()
+  while (current_start <= end_date) {
+    current_end <- min(current_start + days(30), end_date)
+    url <- sprintf(
+      "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=%s&end_date=%s&station=%s&product=%s&datum=%s&time_zone=%s&units=%s&format=csv",
+      format(current_start, "%Y%m%d"), format(current_end, "%Y%m%d"),
+      station$id, param, datum, time_zone, units
+    )
+    temp_data <- tryCatch({
+      read.csv(url)
+    }, error = function(e) {
+      message(sprintf("Data not found for %s %s %s, skipping...", station$id, param, format(current_start, "%Y%m%d")))
+      NULL
+    })
+    if (!is.null(temp_data)) all_data[[length(all_data) + 1]] <- temp_data
+    current_start <- current_end + days(1)
+  }
+  if (length(all_data) > 0) bind_rows(all_data) else NULL
+}
+
+# Helper function to flatten station metadata for CSV
+flatten_station <- function(station) {
+  data.frame(
+    id = station$id,
+    name = station$name,
+    lat = station$lat,
+    lng = station$lng,
+    port_code = station$port_code,
+    product_names = paste(station$product_names, collapse = "; "),
+    datum = station$datum,
+    time_zone = station$time_zone,
+    units = station$units,
+    bins = if (!is.null(station$bins)) jsonlite::toJSON(station$bins, auto_unbox = TRUE) else NA,
+    sensors = if (!is.null(station$sensors)) jsonlite::toJSON(station$sensors, auto_unbox = TRUE) else NA,
+    deployments = if (!is.null(station$deployments)) jsonlite::toJSON(station$deployments, auto_unbox = TRUE) else NA
+  )
+}
+
+# Helper function to save the data into year folders for each stations
+save_data <- function(data, station_id, param, year, product_type) {
+  dir_path <- file.path(station_id, product_type)
+  if (!dir.exists(dir_path)) dir.create(dir_path, recursive = TRUE)
+  year_file <- file.path(dir_path, sprintf("%s_%d.csv", param, year))
+  write.csv(data, year_file, row.names = FALSE)
+  message(sprintf("Yearly file created: %s", year_file))
+}
+
+
+all_station_data <- list() # helps save all data into dataframe so that we can plot it without reareading everythig
+
+for (station in stations_list) {
+  station_id <- station$id
+  all_station_data[[station_id]] <- list(
+    water_level = list(),
+    meteorological = list()
+  )
+  
+  # Water Levels
+  if ("Water Levels" %in% unlist(strsplit(station$product_names, ",\\s*"))) {
+    for (year in years) {
+      for (wl_param in wl_params) {
+        combined_data <- fetch_data(station, year, wl_param, "Water Levels", datum, time_zone, units)
+        if (!is.null(combined_data)) {
+          all_station_data[[station_id]]$water_level[[as.character(year)]] <- combined_data
+        }
+      }
+    }
+  }
+  
+  # Meteorological
+  if ("Meteorological" %in% unlist(strsplit(station$product_names, ",\\s*"))) {
+    for (year in years) {
+      for (met_param in met_params) {
+        combined_data <- fetch_data(station, year, met_param, "Meteorological", datum, time_zone, units)
+        if (!is.null(combined_data)) {
+          if (is.null(all_station_data[[station_id]]$meteorological[[as.character(year)]])) {
+            all_station_data[[station_id]]$meteorological[[as.character(year)]] <- list()
+          }
+          all_station_data[[station_id]]$meteorological[[as.character(year)]][[met_param]] <- combined_data
+        }
+      }
+    }
+  }
+}
+
+
+
+
+
+```
+
+Now we can Plot the Data
+
+
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+selected_stations <- c("9044020")  
+
+selected_years <- 2019:2021                   
+
+plot_data <- list()
+# we can loop through each stations and also year available per station so we can filter it
+for (station_id in selected_stations) {
+  for (year in selected_years) {
+    year_str <- as.character(year)
+    if (!is.null(all_station_data[[station_id]]$water_level[[year_str]])) {
+      df <- all_station_data[[station_id]]$water_level[[year_str]]
+      if (!is.null(df)) {
+        df$station_id <- station_id
+        df$year <- year
+        plot_data[[length(plot_data) + 1]] <- df
+      }
+    }
+  }
+}
+plot_df <- bind_rows(plot_data)
+
+
+plot_df$datetime <- as.POSIXct(plot_df$Date.Time, format="%Y-%m-%d %H:%M", tz="UTC")
+
+ggplot(plot_df, aes(x = datetime, y = Water.Level, color = station_id)) +
+  geom_line() +
+  #facet_wrap(~ year) +
+  labs(title = paste("Water Level by Station", station$id),
+         x = "Date", y = "Water Level",color = "Station ID") +
+  theme_minimal()
+
+
+
+```
+
+
+
+
+
+
+
+
